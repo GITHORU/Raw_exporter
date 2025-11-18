@@ -1,7 +1,7 @@
-# Dépendances pour le convertisseur ORF vers TIFF
+# Dépendances pour les convertisseurs ORF/DNG vers TIFF
 # Installation: pip install -r requirements.txt
 
-# Traitement des images RAW
+# Traitement des images RAW (supporte ORF, DNG et autres formats RAW)
 rawpy>=0.18.0
 
 # Manipulation d'images

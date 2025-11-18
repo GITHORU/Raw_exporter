@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Convertisseur ORF vers TIFF pour images de photogrammétrie
-Permet de convertir les fichiers ORF en TIFF sans correction de distorsion
+Convertisseur DNG vers TIFF pour images de photogrammétrie
+Permet de convertir les fichiers DNG en TIFF sans correction de distorsion
 """
 
 import os
@@ -29,15 +29,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class ORFToTIFFConverter:
-    """Convertisseur de fichiers ORF vers TIFF"""
+class DNGToTIFFConverter:
+    """Convertisseur de fichiers DNG vers TIFF"""
     
     def __init__(self, input_dir, output_dir=None, quality=95, keep_16bit=False, brightness=1.5, contrast=1.0):
         """
         Initialise le convertisseur
         
         Args:
-            input_dir (str): Répertoire contenant les fichiers ORF
+            input_dir (str): Répertoire contenant les fichiers DNG
             output_dir (str): Répertoire de sortie (optionnel)
             quality (int): Qualité de compression TIFF (1-100)
             keep_16bit (bool): Conserver les 16 bits (recommandé pour photogrammétrie)
@@ -82,13 +82,13 @@ class ORFToTIFFConverter:
         logger.info(f"Répertoire d'entrée: {self.input_dir}")
         logger.info(f"Répertoire de sortie: {self.output_dir}")
     
-    def find_orf_files(self):
-        """Trouve tous les fichiers ORF dans le répertoire d'entrée"""
+    def find_dng_files(self):
+        """Trouve tous les fichiers DNG dans le répertoire d'entrée"""
         # Utiliser un set pour éviter les doublons (Windows n'est pas sensible à la casse)
-        orf_files = set(self.input_dir.glob("*.ORF")) | set(self.input_dir.glob("*.orf"))
-        orf_files = sorted(list(orf_files))  # Convertir en liste triée
-        logger.info(f"Trouvé {len(orf_files)} fichier(s) ORF")
-        return orf_files
+        dng_files = set(self.input_dir.glob("*.DNG")) | set(self.input_dir.glob("*.dng"))
+        dng_files = sorted(list(dng_files))  # Convertir en liste triée
+        logger.info(f"Trouvé {len(dng_files)} fichier(s) DNG")
+        return dng_files
     
     def get_crop_factor(self, make, model, sensor_width=None, sensor_height=None):
         """
@@ -171,17 +171,27 @@ class ORFToTIFFConverter:
             logger.info(f"Pentax APS-C détecté ({model}), facteur: 1.5x")
             return 1.5
         
+        # Leica (souvent plein format)
+        if 'leica' in make_lower:
+            logger.info(f"Leica détecté ({model}), facteur: 1.0x (plein format présumé)")
+            return 1.0
+        
+        # Hasselblad (moyen format)
+        if 'hasselblad' in make_lower:
+            logger.info(f"Hasselblad détecté ({model}), facteur: 0.64x (moyen format)")
+            return 0.64
+        
         # Par défaut, si on ne connaît pas, ne pas calculer la focale équivalente
         logger.warning(f"Marque/modèle inconnu ({make}/{model}), impossible de déterminer le facteur de conversion")
         logger.warning("Suggestion: vérifiez les spécifications de votre appareil ou ajoutez-le manuellement")
         return None
     
-    def extract_exif_metadata(self, orf_path):
+    def extract_exif_metadata(self, dng_path):
         """
         Extrait les métadonnées EXIF importantes du fichier RAW en utilisant exifread
         
         Args:
-            orf_path: Chemin vers le fichier ORF
+            dng_path: Chemin vers le fichier DNG
             
         Returns:
             dict: Dictionnaire des métadonnées EXIF
@@ -189,8 +199,8 @@ class ORFToTIFFConverter:
         exif_data = {}
         
         try:
-            # Lire les métadonnées EXIF directement depuis le fichier ORF
-            with open(orf_path, 'rb') as f:
+            # Lire les métadonnées EXIF directement depuis le fichier DNG
+            with open(dng_path, 'rb') as f:
                 tags = exifread.process_file(f, details=False)
             
             # Extraire les métadonnées importantes
@@ -312,28 +322,28 @@ class ORFToTIFFConverter:
         
         return exif_data
     
-    def convert_single_file(self, orf_path):
+    def convert_single_file(self, dng_path):
         """
-        Convertit un seul fichier ORF en TIFF
+        Convertit un seul fichier DNG en TIFF
         
         Args:
-            orf_path (Path): Chemin vers le fichier ORF
+            dng_path (Path): Chemin vers le fichier DNG
             
         Returns:
             bool: True si la conversion a réussi, False sinon
         """
         try:
             # Nom du fichier de sortie
-            tiff_filename = orf_path.stem + ".tiff"
+            tiff_filename = dng_path.stem + ".tiff"
             tiff_path = self.output_dir / tiff_filename
             
-            logger.info(f"Conversion de: {orf_path.name}")
+            logger.info(f"Conversion de: {dng_path.name}")
             
-            # Extraire les métadonnées EXIF importantes directement depuis le fichier ORF
-            exif_data = self.extract_exif_metadata(orf_path)
+            # Extraire les métadonnées EXIF importantes directement depuis le fichier DNG
+            exif_data = self.extract_exif_metadata(dng_path)
             
             # Ouvrir le fichier RAW avec rawpy
-            with rawpy.imread(str(orf_path)) as raw:
+            with rawpy.imread(str(dng_path)) as raw:
                 
                 # Obtenir les données RAW avec ajustements pour photogrammétrie
                 # Cela évite la correction de distorsion automatique mais améliore la luminosité
@@ -521,26 +531,26 @@ class ORFToTIFFConverter:
             
         except Exception as e:
             import traceback
-            logger.error(f"✗ Erreur lors de la conversion de {orf_path.name}: {str(e)}")
+            logger.error(f"✗ Erreur lors de la conversion de {dng_path.name}: {str(e)}")
             logger.error(f"Traceback complet: {traceback.format_exc()}")
             return False
     
     def convert_all(self):
-        """Convertit tous les fichiers ORF trouvés"""
-        orf_files = self.find_orf_files()
+        """Convertit tous les fichiers DNG trouvés"""
+        dng_files = self.find_dng_files()
         
-        if not orf_files:
-            logger.warning("Aucun fichier ORF trouvé dans le répertoire spécifié")
+        if not dng_files:
+            logger.warning("Aucun fichier DNG trouvé dans le répertoire spécifié")
             return
         
-        logger.info(f"Début de la conversion de {len(orf_files)} fichier(s)")
+        logger.info(f"Début de la conversion de {len(dng_files)} fichier(s)")
         
         successful_conversions = 0
         failed_conversions = 0
         
         # Conversion avec barre de progression
-        for orf_file in tqdm(orf_files, desc="Conversion ORF → TIFF"):
-            if self.convert_single_file(orf_file):
+        for dng_file in tqdm(dng_files, desc="Conversion DNG → TIFF"):
+            if self.convert_single_file(dng_file):
                 successful_conversions += 1
             else:
                 failed_conversions += 1
@@ -549,7 +559,7 @@ class ORFToTIFFConverter:
         logger.info(f"\n=== RÉSUMÉ DE LA CONVERSION ===")
         logger.info(f"Conversions réussies: {successful_conversions}")
         logger.info(f"Conversions échouées: {failed_conversions}")
-        logger.info(f"Total traité: {len(orf_files)}")
+        logger.info(f"Total traité: {len(dng_files)}")
         
         if successful_conversions > 0:
             logger.info(f"Fichiers TIFF sauvegardés dans: {self.output_dir}")
@@ -557,14 +567,14 @@ class ORFToTIFFConverter:
 def interactive_mode():
     """Mode interactif pour faciliter l'utilisation"""
     print("=" * 60)
-    print("    CONVERTISSEUR ORF VERS TIFF")
+    print("    CONVERTISSEUR DNG VERS TIFF")
     print("    Pour images de photogrammétrie")
     print("=" * 60)
     print()
     
     # Demander le répertoire d'entrée
     while True:
-        input_dir = input("📁 Chemin vers le dossier contenant les images ORF: ").strip()
+        input_dir = input("📁 Chemin vers le dossier contenant les images DNG: ").strip()
         if not input_dir:
             print("❌ Veuillez entrer un chemin valide")
             continue
@@ -576,13 +586,13 @@ def interactive_mode():
             print(f"❌ Le répertoire '{input_dir}' n'existe pas")
             continue
         
-        # Vérifier qu'il y a des fichiers ORF
-        orf_files = list(Path(input_dir).glob("*.ORF")) + list(Path(input_dir).glob("*.orf"))
-        if not orf_files:
-            print(f"❌ Aucun fichier ORF trouvé dans '{input_dir}'")
+        # Vérifier qu'il y a des fichiers DNG
+        dng_files = list(Path(input_dir).glob("*.DNG")) + list(Path(input_dir).glob("*.dng"))
+        if not dng_files:
+            print(f"❌ Aucun fichier DNG trouvé dans '{input_dir}'")
             continue
         
-        print(f"✅ Trouvé {len(orf_files)} fichier(s) ORF")
+        print(f"✅ Trouvé {len(dng_files)} fichier(s) DNG")
         break
     
     # Demander le répertoire de sortie
@@ -652,7 +662,7 @@ def interactive_mode():
     print(f"   • 16 bits conservés: {'Oui' if keep_16bit else 'Non'}")
     print(f"   • Luminosité: {brightness}")
     print(f"   • Contraste: {contrast}")
-    print(f"   • Nombre de fichiers: {len(orf_files)}")
+    print(f"   • Nombre de fichiers: {len(dng_files)}")
     print()
     
     confirm = input("🚀 Démarrer la conversion ? (o/N): ").strip().lower()
@@ -662,7 +672,7 @@ def interactive_mode():
     
     # Lancer la conversion
     print()
-    converter = ORFToTIFFConverter(
+    converter = DNGToTIFFConverter(
         input_dir=input_dir,
         output_dir=output_dir,
         quality=int(quality),  # S'assurer que c'est un entier
@@ -676,28 +686,27 @@ def interactive_mode():
 def main():
     """Fonction principale avec mode interactif et ligne de commande"""
     parser = argparse.ArgumentParser(
-        description="Convertisseur ORF vers TIFF pour images de photogrammétrie",
+        description="Convertisseur DNG vers TIFF pour images de photogrammétrie",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples d'utilisation:
-  python orf_to_tiff_converter.py                    # Mode interactif
-  python orf_to_tiff_converter.py /chemin/vers/images
-  python orf_to_tiff_converter.py /chemin/vers/images -o /chemin/sortie
-  python orf_to_tiff_converter.py /chemin/vers/images -q 100
+  python dng_to_tiff_converter.py                    # Mode interactif
+  python dng_to_tiff_converter.py /chemin/vers/images
+  python dng_to_tiff_converter.py /chemin/vers/images -o /chemin/sortie
+  python dng_to_tiff_converter.py /chemin/vers/images -b 1.5 -c 1.2 --16bit
         """
     )
     
     parser.add_argument(
         'input_dir',
         nargs='?',
-        help='Répertoire contenant les fichiers ORF à convertir (optionnel pour mode interactif)'
+        help='Répertoire contenant les fichiers DNG à convertir (optionnel pour mode interactif)'
     )
     
     parser.add_argument(
         '-o', '--output',
         help='Répertoire de sortie pour les fichiers TIFF (défaut: TIFF_output dans le répertoire d\'entrée)'
     )
-    
     
     parser.add_argument(
         '-v', '--verbose',
@@ -750,7 +759,7 @@ Exemples d'utilisation:
         sys.exit(1)
     
     # Créer et lancer le convertisseur
-    converter = ORFToTIFFConverter(
+    converter = DNGToTIFFConverter(
         input_dir=args.input_dir,
         output_dir=args.output,
         quality=100,  # Qualité fixée pour compatibilité MicMac
@@ -763,3 +772,4 @@ Exemples d'utilisation:
 
 if __name__ == "__main__":
     main()
+
