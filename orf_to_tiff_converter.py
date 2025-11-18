@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Convertisseur ORF vers TIFF pour images de photogrammétrie
+Permet de convertir les fichiers ORF en TIFF sans correction de distorsion
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+from PIL import Image
+from PIL.ExifTags import TAGS
+import rawpy
+import numpy as np
+from tqdm import tqdm
+import logging
+import piexif
+import exifread
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('conversion.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class ORFToTIFFConverter:
+    """Convertisseur de fichiers ORF vers TIFF"""
+    
+    def __init__(self, input_dir, output_dir=None, quality=95, keep_16bit=False, brightness=1.5, contrast=1.0):
+        """
+        Initialise le convertisseur
+        
+        Args:
+            input_dir (str): Répertoire contenant les fichiers ORF
+            output_dir (str): Répertoire de sortie (optionnel)
+            quality (int): Qualité de compression TIFF (1-100)
+            keep_16bit (bool): Conserver les 16 bits (recommandé pour photogrammétrie)
+            brightness (float): Facteur de luminosité (0.5-2.0, défaut 1.5)
+            contrast (float): Facteur de contraste (0.5-2.0, défaut 1.0)
+        """
+        self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir) if output_dir else self.input_dir / "TIFF_output"
+        
+        # Validation et conversion de la qualité
+        try:
+            self.quality = int(quality)
+            if not (1 <= self.quality <= 100):
+                raise ValueError("La qualité doit être entre 1 et 100")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Qualité invalide '{quality}', utilisation de la valeur par défaut 95")
+            self.quality = 95
+        
+        self.keep_16bit = keep_16bit
+        
+        # Validation de la luminosité
+        try:
+            self.brightness = float(brightness)
+            if not (0.5 <= self.brightness <= 2.0):
+                raise ValueError("La luminosité doit être entre 0.5 et 2.0")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Luminosité invalide '{brightness}', utilisation de la valeur par défaut 1.5")
+            self.brightness = 1.5
+        
+        # Validation du contraste
+        try:
+            self.contrast = float(contrast)
+            if not (0.5 <= self.contrast <= 2.0):
+                raise ValueError("Le contraste doit être entre 0.5 et 2.0")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Contraste invalide '{contrast}', utilisation de la valeur par défaut 1.0")
+            self.contrast = 1.0
+        
+        # Créer le répertoire de sortie s'il n'existe pas
+        self.output_dir.mkdir(exist_ok=True)
+        
+        logger.info(f"Répertoire d'entrée: {self.input_dir}")
+        logger.info(f"Répertoire de sortie: {self.output_dir}")
+    
+    def find_orf_files(self):
+        """Trouve tous les fichiers ORF dans le répertoire d'entrée"""
+        # Utiliser un set pour éviter les doublons (Windows n'est pas sensible à la casse)
+        orf_files = set(self.input_dir.glob("*.ORF")) | set(self.input_dir.glob("*.orf"))
+        orf_files = sorted(list(orf_files))  # Convertir en liste triée
+        logger.info(f"Trouvé {len(orf_files)} fichier(s) ORF")
+        return orf_files
+    
+    def get_crop_factor(self, make, model, sensor_width=None, sensor_height=None):
+        """
+        Détermine le facteur de conversion (crop factor) pour calculer la focale équivalente 35mm
+        
+        Args:
+            make: Marque de l'appareil photo
+            model: Modèle de l'appareil photo
+            sensor_width: Largeur du capteur en mm (si disponible dans les EXIF)
+            sensor_height: Hauteur du capteur en mm (si disponible dans les EXIF)
+            
+        Returns:
+            float: Facteur de conversion (1.0 = plein format, 2.0 = Micro Four Thirds, etc.)
+        """
+        # Si on a les dimensions du capteur, calculer le facteur précisément
+        if sensor_width and sensor_height:
+            # Capteur plein format = 36mm x 24mm
+            full_frame_diagonal = (36**2 + 24**2)**0.5  # ≈ 43.27mm
+            sensor_diagonal = (sensor_width**2 + sensor_height**2)**0.5
+            crop_factor = full_frame_diagonal / sensor_diagonal
+            logger.info(f"Facteur de conversion calculé depuis les dimensions du capteur: {crop_factor:.2f}x")
+            return crop_factor
+        
+        # Sinon, utiliser les valeurs connues par marque/modèle
+        make_lower = str(make).lower() if make else ""
+        model_lower = str(model).lower() if model else ""
+        
+        # Micro Four Thirds (Olympus, Panasonic, OM Digital) - 17.3mm x 13mm
+        if any(brand in make_lower for brand in ['olympus', 'om digital', 'panasonic']):
+            logger.info(f"Micro Four Thirds détecté ({make} {model}), facteur: 2.0x")
+            return 2.0
+        
+        # APS-C Canon (22.3mm x 14.9mm) - 1.6x
+        if 'canon' in make_lower:
+            # Certains modèles Canon sont plein format
+            if any(full_frame in model_lower for full_frame in ['1d', '5d', '6d', 'r5', 'r6', 'r3']):
+                logger.info(f"Canon plein format détecté ({model}), facteur: 1.0x")
+                return 1.0
+            logger.info(f"Canon APS-C détecté ({model}), facteur: 1.6x")
+            return 1.6
+        
+        # APS-C Nikon (23.5mm x 15.6mm) - 1.5x
+        if 'nikon' in make_lower:
+            # Les modèles plein format
+            if any(full_frame in model_lower for full_frame in ['d3', 'd4', 'd5', 'd6', 'd700', 'd800', 'd810', 'd850', 'z7', 'z9', 'z8']):
+                logger.info(f"Nikon plein format détecté ({model}), facteur: 1.0x")
+                return 1.0
+            logger.info(f"Nikon APS-C détecté ({model}), facteur: 1.5x")
+            return 1.5
+        
+        # Sony
+        if 'sony' in make_lower:
+            # A7, A9, A1 sont plein format
+            if any(full_frame in model_lower for full_frame in ['a7', 'a9', 'a1']):
+                logger.info(f"Sony plein format détecté ({model}), facteur: 1.0x")
+                return 1.0
+            # A6000, A6300, A6400, A6500, A6600 sont APS-C
+            if any(aps_c in model_lower for aps_c in ['a6000', 'a6300', 'a6400', 'a6500', 'a6600']):
+                logger.info(f"Sony APS-C détecté ({model}), facteur: 1.5x")
+                return 1.5
+            # Par défaut, considérer APS-C pour Sony
+            logger.warning(f"Sony modèle non reconnu ({model}), utilisation du facteur APS-C par défaut: 1.5x")
+            return 1.5
+        
+        # Fujifilm (APS-C généralement)
+        if 'fujifilm' in make_lower or 'fuji' in make_lower:
+            # GFX sont moyen format (0.79x)
+            if 'gfx' in model_lower:
+                logger.info(f"Fujifilm moyen format détecté ({model}), facteur: 0.79x")
+                return 0.79
+            logger.info(f"Fujifilm APS-C détecté ({model}), facteur: 1.5x")
+            return 1.5
+        
+        # Pentax
+        if 'pentax' in make_lower:
+            # K-1 est plein format
+            if 'k-1' in model_lower:
+                logger.info(f"Pentax plein format détecté ({model}), facteur: 1.0x")
+                return 1.0
+            logger.info(f"Pentax APS-C détecté ({model}), facteur: 1.5x")
+            return 1.5
+        
+        # Par défaut, si on ne connaît pas, ne pas calculer la focale équivalente
+        logger.warning(f"Marque/modèle inconnu ({make}/{model}), impossible de déterminer le facteur de conversion")
+        logger.warning("Suggestion: vérifiez les spécifications de votre appareil ou ajoutez-le manuellement")
+        return None
+    
+    def extract_exif_metadata(self, orf_path):
+        """
+        Extrait les métadonnées EXIF importantes du fichier RAW en utilisant exifread
+        
+        Args:
+            orf_path: Chemin vers le fichier ORF
+            
+        Returns:
+            dict: Dictionnaire des métadonnées EXIF
+        """
+        exif_data = {}
+        
+        try:
+            # Lire les métadonnées EXIF directement depuis le fichier ORF
+            with open(orf_path, 'rb') as f:
+                tags = exifread.process_file(f, details=False)
+            
+            # Extraire les métadonnées importantes
+            if 'EXIF FocalLength' in tags:
+                focal_length = float(tags['EXIF FocalLength'].values[0])
+                exif_data['FocalLength'] = focal_length
+            
+            if 'EXIF FNumber' in tags:
+                f_number = float(tags['EXIF FNumber'].values[0])
+                exif_data['FNumber'] = f_number
+            
+            if 'EXIF ExposureTime' in tags:
+                exposure_time = float(tags['EXIF ExposureTime'].values[0])
+                exif_data['ExposureTime'] = exposure_time
+            
+            if 'EXIF ISOSpeedRatings' in tags:
+                iso = int(tags['EXIF ISOSpeedRatings'].values[0])
+                exif_data['ISOSpeedRatings'] = iso
+            
+            if 'Image Make' in tags:
+                make = str(tags['Image Make'].values)
+                exif_data['Make'] = make
+            
+            if 'Image Model' in tags:
+                model = str(tags['Image Model'].values)
+                exif_data['Model'] = model
+            
+            if 'EXIF ExifImageWidth' in tags:
+                width = int(tags['EXIF ExifImageWidth'].values[0])
+                exif_data['ImageWidth'] = width
+            
+            if 'EXIF ExifImageLength' in tags:
+                height = int(tags['EXIF ExifImageLength'].values[0])
+                exif_data['ImageLength'] = height
+            
+            # Vérifier si la focale équivalente 35mm est déjà dans les métadonnées
+            if 'EXIF FocalLengthIn35mmFilm' in tags:
+                focal_35mm = int(tags['EXIF FocalLengthIn35mmFilm'].values[0])
+                exif_data['FocalLengthIn35mmFilm'] = focal_35mm
+            
+            # Essayer d'extraire des informations sur le capteur pour calculer le facteur
+            # Certains appareils stockent la taille du capteur dans les EXIF
+            if 'EXIF SensorWidth' in tags and 'EXIF SensorHeight' in tags:
+                sensor_width = float(tags['EXIF SensorWidth'].values[0])
+                sensor_height = float(tags['EXIF SensorHeight'].values[0])
+                exif_data['SensorWidth'] = sensor_width
+                exif_data['SensorHeight'] = sensor_height
+            
+            # Si pas de métadonnées disponibles, ne pas utiliser de valeurs par défaut
+            if not exif_data:
+                logger.warning("Aucune métadonnée EXIF trouvée, fichier TIFF sans métadonnées")
+            
+            if exif_data:
+                logger.info(f"Métadonnées extraites: {exif_data}")
+            else:
+                logger.info("Aucune métadonnée EXIF disponible")
+            
+        except Exception as e:
+            logger.warning(f"Impossible d'extraire les métadonnées EXIF: {e}")
+            exif_data = {}  # Retourner un dictionnaire vide
+        
+        return exif_data
+    
+    def convert_single_file(self, orf_path):
+        """
+        Convertit un seul fichier ORF en TIFF
+        
+        Args:
+            orf_path (Path): Chemin vers le fichier ORF
+            
+        Returns:
+            bool: True si la conversion a réussi, False sinon
+        """
+        try:
+            # Nom du fichier de sortie
+            tiff_filename = orf_path.stem + ".tiff"
+            tiff_path = self.output_dir / tiff_filename
+            
+            logger.info(f"Conversion de: {orf_path.name}")
+            
+            # Extraire les métadonnées EXIF importantes directement depuis le fichier ORF
+            exif_data = self.extract_exif_metadata(orf_path)
+            
+            # Ouvrir le fichier RAW avec rawpy
+            with rawpy.imread(str(orf_path)) as raw:
+                
+                # Obtenir les données RAW avec ajustements pour photogrammétrie
+                # Cela évite la correction de distorsion automatique mais améliore la luminosité
+                rgb_array = raw.postprocess(
+                    use_camera_wb=True,      # Utiliser le white balance de l'appareil (comme les JPG)
+                    half_size=False,         # Pleine résolution
+                    no_auto_bright=True,     # Désactiver l'ajustement automatique de luminosité (évite les variations)
+                    output_bps=16,           # 16 bits par canal
+                    gamma=(2.222, 4.5),     # Correction gamma pour éclaircir l'image
+                    bright=self.brightness,  # Facteur de luminosité ajustable (fixe pour toutes les images)
+                    highlight_mode=rawpy.HighlightMode.Clip,  # Gestion des hautes lumières
+                    use_auto_wb=False       # Utiliser la WB de l'appareil, pas l'AWB automatique
+                )
+                
+                # Appliquer le contraste manuellement (rawpy ne supporte pas le paramètre contrast)
+                if self.contrast != 1.0:
+                    # Déterminer si on travaille en 16 bits
+                    is_16bit = rgb_array.dtype == np.uint16
+                    # Conversion en float pour les calculs
+                    rgb_array = rgb_array.astype(np.float32)
+                    # Calculer le point médian (32768 pour 16 bits, 128 pour 8 bits)
+                    midpoint = 32768.0 if is_16bit else 128.0
+                    # Appliquer le contraste : (pixel - midpoint) * contrast + midpoint
+                    rgb_array = (rgb_array - midpoint) * self.contrast + midpoint
+                    # Clamper les valeurs entre 0 et la valeur max
+                    max_val = 65535.0 if is_16bit else 255.0
+                    rgb_array = np.clip(rgb_array, 0, max_val)
+                    # Reconvertir au type d'origine
+                    if is_16bit:
+                        rgb_array = rgb_array.astype(np.uint16)
+                    else:
+                        rgb_array = rgb_array.astype(np.uint8)
+            
+            # S'assurer que les données sont dans le bon format pour PIL
+            if self.keep_16bit and rgb_array.dtype == np.uint16:
+                # Conserver les 16 bits pour la photogrammétrie
+                pass  # Garder les données en uint16
+            elif rgb_array.dtype == np.uint16:
+                # Convertir de 16 bits à 8 bits en préservant la qualité
+                rgb_array = (rgb_array / 256).astype(np.uint8)
+            elif rgb_array.dtype != np.uint8:
+                # Pour d'autres types, normaliser vers uint8
+                rgb_array = np.clip(rgb_array, 0, 65535)  # Clamp les valeurs
+                rgb_array = (rgb_array / 256).astype(np.uint8)
+            
+            # Vérifier les dimensions
+            if len(rgb_array.shape) != 3 or rgb_array.shape[2] != 3:
+                raise ValueError(f"Format d'image non supporté: {rgb_array.shape}")
+            
+            # Convertir en PIL Image avec le bon mode
+            if self.keep_16bit and rgb_array.dtype == np.uint16:
+                image = Image.fromarray(rgb_array, 'RGB')
+            else:
+                image = Image.fromarray(rgb_array, 'RGB')
+            
+            # Sauvegarder en TIFF sans compression (compatible MicMac)
+            save_kwargs = {
+                'format': 'TIFF'
+                # Pas de compression pour compatibilité MicMac
+            }
+            
+            # Ajouter les métadonnées EXIF si disponibles
+            if exif_data:
+                try:
+                    # Créer un dictionnaire EXIF avec piexif
+                    exif_dict = {
+                        "0th": {},
+                        "Exif": {},
+                        "GPS": {},
+                        "1st": {},
+                        "thumbnail": None,
+                        "interop": {}
+                    }
+                    
+                    # Ajouter les métadonnées principales
+                    if 'Make' in exif_data:
+                        exif_dict["0th"][piexif.ImageIFD.Make] = exif_data['Make'].encode('utf-8')
+                    if 'Model' in exif_data:
+                        exif_dict["0th"][piexif.ImageIFD.Model] = exif_data['Model'].encode('utf-8')
+                    
+                    # Ajouter les métadonnées EXIF
+                    if 'FocalLength' in exif_data:
+                        # Convertir en format rationnel piexif
+                        focal_length = float(exif_data['FocalLength'])
+                        focal_rational = (int(focal_length * 1000), 1000)
+                        
+                        # Ajouter dans le IFD EXIF (la focale n'existe pas dans le IFD Image)
+                        exif_dict["Exif"][piexif.ExifIFD.FocalLength] = focal_rational
+                        
+                        # Ajouter la focale équivalente 35mm pour MicMac
+                        if 'FocalLengthIn35mmFilm' in exif_data:
+                            # Utiliser la valeur déjà présente dans les métadonnées
+                            focal_35mm = int(exif_data['FocalLengthIn35mmFilm'])
+                            exif_dict["Exif"][piexif.ExifIFD.FocalLengthIn35mmFilm] = focal_35mm
+                            logger.info(f"Focale équivalente 35mm trouvée dans les métadonnées: {focal_35mm}mm")
+                        else:
+                            # Calculer avec le facteur de conversion détecté
+                            make = exif_data.get('Make', '')
+                            model = exif_data.get('Model', '')
+                            sensor_width = exif_data.get('SensorWidth')
+                            sensor_height = exif_data.get('SensorHeight')
+                            crop_factor = self.get_crop_factor(make, model, sensor_width, sensor_height)
+                            
+                            if crop_factor is not None:
+                                focal_35mm = int(focal_length * crop_factor)
+                                exif_dict["Exif"][piexif.ExifIFD.FocalLengthIn35mmFilm] = focal_35mm
+                                logger.info(f"Focale: {focal_length}mm → Équivalent 35mm: {focal_35mm}mm (facteur: {crop_factor}x)")
+                            else:
+                                logger.warning(f"Impossible de calculer la focale équivalente 35mm pour {make} {model}")
+                    
+                    if 'FNumber' in exif_data:
+                        f_number = float(exif_data['FNumber'])
+                        exif_dict["Exif"][piexif.ExifIFD.FNumber] = (int(f_number * 100), 100)
+                    
+                    if 'ExposureTime' in exif_data:
+                        exposure_time = float(exif_data['ExposureTime'])
+                        exif_dict["Exif"][piexif.ExifIFD.ExposureTime] = (int(exposure_time * 1000000), 1000000)
+                    
+                    if 'ISOSpeedRatings' in exif_data:
+                        exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings] = int(exif_data['ISOSpeedRatings'])
+                    
+                    # Convertir en bytes EXIF
+                    exif_bytes = piexif.dump(exif_dict)
+                    save_kwargs['exif'] = exif_bytes
+                    logger.info(f"Métadonnées EXIF ajoutées: {list(exif_data.keys())}")
+                    
+                except Exception as e:
+                    logger.warning(f"Erreur lors de l'ajout des métadonnées EXIF: {e}")
+            
+            image.save(tiff_path, **save_kwargs)
+            
+            logger.info(f"✓ Converti avec succès: {tiff_filename}")
+            return True
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"✗ Erreur lors de la conversion de {orf_path.name}: {str(e)}")
+            logger.error(f"Traceback complet: {traceback.format_exc()}")
+            return False
+    
+    def convert_all(self):
+        """Convertit tous les fichiers ORF trouvés"""
+        orf_files = self.find_orf_files()
+        
+        if not orf_files:
+            logger.warning("Aucun fichier ORF trouvé dans le répertoire spécifié")
+            return
+        
+        logger.info(f"Début de la conversion de {len(orf_files)} fichier(s)")
+        
+        successful_conversions = 0
+        failed_conversions = 0
+        
+        # Conversion avec barre de progression
+        for orf_file in tqdm(orf_files, desc="Conversion ORF → TIFF"):
+            if self.convert_single_file(orf_file):
+                successful_conversions += 1
+            else:
+                failed_conversions += 1
+        
+        # Résumé
+        logger.info(f"\n=== RÉSUMÉ DE LA CONVERSION ===")
+        logger.info(f"Conversions réussies: {successful_conversions}")
+        logger.info(f"Conversions échouées: {failed_conversions}")
+        logger.info(f"Total traité: {len(orf_files)}")
+        
+        if successful_conversions > 0:
+            logger.info(f"Fichiers TIFF sauvegardés dans: {self.output_dir}")
+
+def interactive_mode():
+    """Mode interactif pour faciliter l'utilisation"""
+    print("=" * 60)
+    print("    CONVERTISSEUR ORF VERS TIFF")
+    print("    Pour images de photogrammétrie")
+    print("=" * 60)
+    print()
+    
+    # Demander le répertoire d'entrée
+    while True:
+        input_dir = input("📁 Chemin vers le dossier contenant les images ORF: ").strip()
+        if not input_dir:
+            print("❌ Veuillez entrer un chemin valide")
+            continue
+        
+        # Supprimer les guillemets si présents
+        input_dir = input_dir.strip('"\'')
+        
+        if not os.path.exists(input_dir):
+            print(f"❌ Le répertoire '{input_dir}' n'existe pas")
+            continue
+        
+        # Vérifier qu'il y a des fichiers ORF
+        orf_files = list(Path(input_dir).glob("*.ORF")) + list(Path(input_dir).glob("*.orf"))
+        if not orf_files:
+            print(f"❌ Aucun fichier ORF trouvé dans '{input_dir}'")
+            continue
+        
+        print(f"✅ Trouvé {len(orf_files)} fichier(s) ORF")
+        break
+    
+    # Demander le répertoire de sortie
+    print()
+    output_dir = input("📁 Répertoire de sortie (Entrée pour utiliser 'TIFF_output'): ").strip()
+    if not output_dir:
+        output_dir = None
+    else:
+        output_dir = output_dir.strip('"\'')
+    
+    # Qualité fixée à 100 pour compatibilité MicMac (pas de compression)
+    quality = 100
+    
+    # Demander si conserver les 16 bits
+    print()
+    keep_16bit_input = input("🔬 Conserver les 16 bits (recommandé pour photogrammétrie) ? (O/n): ").strip().lower()
+    keep_16bit = keep_16bit_input not in ['n', 'non', 'no']
+    
+    # Demander la luminosité
+    print()
+    print("💡 Luminosité:")
+    print("   • 0.5-0.8: Plus sombre")
+    print("   • 1.0: Normal")
+    print("   • 1.2-2.0: Plus lumineux")
+    while True:
+        brightness_input = input("   Facteur (0.5-2.0, défaut 1.5): ").strip()
+        if not brightness_input:
+            brightness = 1.5  # Valeur par défaut pour éclaircir les images
+            break
+        
+        try:
+            brightness = float(brightness_input)
+            if 0.5 <= brightness <= 2.0:
+                break
+            else:
+                print("❌ La luminosité doit être entre 0.5 et 2.0")
+        except ValueError:
+            print("❌ Veuillez entrer un nombre valide")
+    
+    # Demander le contraste
+    print()
+    print("🎨 Contraste:")
+    print("   • 0.5-0.8: Plus doux (moins de contraste)")
+    print("   • 1.0: Normal")
+    print("   • 1.2-2.0: Plus contrasté")
+    while True:
+        contrast_input = input("   Facteur (0.5-2.0, défaut 1.0): ").strip()
+        if not contrast_input:
+            contrast = 1.0  # Valeur par défaut normale
+            break
+        
+        try:
+            contrast = float(contrast_input)
+            if 0.5 <= contrast <= 2.0:
+                break
+            else:
+                print("❌ Le contraste doit être entre 0.5 et 2.0")
+        except ValueError:
+            print("❌ Veuillez entrer un nombre valide")
+    
+    # Confirmation
+    print()
+    print("📋 RÉCAPITULATIF:")
+    print(f"   • Répertoire source: {input_dir}")
+    print(f"   • Répertoire sortie: {output_dir or 'TIFF_output (dans le dossier source)'}")
+    print(f"   • Compression: Aucune (compatible MicMac)")
+    print(f"   • 16 bits conservés: {'Oui' if keep_16bit else 'Non'}")
+    print(f"   • Luminosité: {brightness}")
+    print(f"   • Contraste: {contrast}")
+    print(f"   • Nombre de fichiers: {len(orf_files)}")
+    print()
+    
+    confirm = input("🚀 Démarrer la conversion ? (o/N): ").strip().lower()
+    if confirm not in ['o', 'oui', 'y', 'yes']:
+        print("❌ Conversion annulée")
+        return
+    
+    # Lancer la conversion
+    print()
+    converter = ORFToTIFFConverter(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        quality=int(quality),  # S'assurer que c'est un entier
+        keep_16bit=keep_16bit,
+        brightness=brightness,
+        contrast=contrast
+    )
+    
+    converter.convert_all()
+
+def main():
+    """Fonction principale avec mode interactif et ligne de commande"""
+    parser = argparse.ArgumentParser(
+        description="Convertisseur ORF vers TIFF pour images de photogrammétrie",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemples d'utilisation:
+  python orf_to_tiff_converter.py                    # Mode interactif
+  python orf_to_tiff_converter.py /chemin/vers/images
+  python orf_to_tiff_converter.py /chemin/vers/images -o /chemin/sortie
+  python orf_to_tiff_converter.py /chemin/vers/images -q 100
+        """
+    )
+    
+    parser.add_argument(
+        'input_dir',
+        nargs='?',
+        help='Répertoire contenant les fichiers ORF à convertir (optionnel pour mode interactif)'
+    )
+    
+    parser.add_argument(
+        '-o', '--output',
+        help='Répertoire de sortie pour les fichiers TIFF (défaut: TIFF_output dans le répertoire d\'entrée)'
+    )
+    
+    
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Mode verbeux'
+    )
+    
+    parser.add_argument(
+        '-i', '--interactive',
+        action='store_true',
+        help='Forcer le mode interactif'
+    )
+    
+    parser.add_argument(
+        '--16bit',
+        action='store_true',
+        dest='keep_16bit',
+        help='Conserver les 16 bits (recommandé pour photogrammétrie)'
+    )
+    
+    parser.add_argument(
+        '-b', '--brightness',
+        type=float,
+        default=1.5,
+        help='Facteur de luminosité (0.5-2.0, défaut 1.5)'
+    )
+    
+    parser.add_argument(
+        '-c', '--contrast',
+        type=float,
+        default=1.0,
+        help='Facteur de contraste (0.5-2.0, défaut 1.0)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Ajuster le niveau de logging
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Si aucun argument n'est fourni ou si mode interactif demandé
+    if not args.input_dir or args.interactive:
+        interactive_mode()
+        return
+    
+    # Mode ligne de commande
+    # Vérifier que le répertoire d'entrée existe
+    if not os.path.exists(args.input_dir):
+        logger.error(f"Le répertoire '{args.input_dir}' n'existe pas")
+        sys.exit(1)
+    
+    # Créer et lancer le convertisseur
+    converter = ORFToTIFFConverter(
+        input_dir=args.input_dir,
+        output_dir=args.output,
+        quality=100,  # Qualité fixée pour compatibilité MicMac
+        keep_16bit=args.keep_16bit,
+        brightness=args.brightness,
+        contrast=args.contrast
+    )
+    
+    converter.convert_all()
+
+if __name__ == "__main__":
+    main()
