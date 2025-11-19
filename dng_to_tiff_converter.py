@@ -249,60 +249,93 @@ class DNGToTIFFConverter:
                 exif_data['SensorWidth'] = sensor_width
                 exif_data['SensorHeight'] = sensor_height
             
-            # Extraire les métadonnées GPS
+            # Extraire les métadonnées GPS en conservant la précision maximale
             gps_data = {}
             if 'GPS GPSLatitude' in tags:
                 lat = tags['GPS GPSLatitude'].values
                 lat_ref = tags.get('GPS GPSLatitudeRef', None)
                 if lat and len(lat) >= 3:
-                    # Convertir de degrés/minutes/secondes en degrés décimaux
-                    lat_deg = float(lat[0].num) / float(lat[0].den) if hasattr(lat[0], 'num') else float(lat[0])
-                    lat_min = float(lat[1].num) / float(lat[1].den) if hasattr(lat[1], 'num') else float(lat[1])
-                    lat_sec = float(lat[2].num) / float(lat[2].den) if hasattr(lat[2], 'num') else float(lat[2])
-                    lat_decimal = lat_deg + lat_min/60.0 + lat_sec/3600.0
-                    if lat_ref and 'S' in str(lat_ref.values):
-                        lat_decimal = -lat_decimal
-                    gps_data['GPSLatitude'] = lat_decimal
-                    gps_data['GPSLatitudeRef'] = str(lat_ref.values) if lat_ref else 'N'
+                    # Conserver directement les valeurs rationnelles DMS pour préserver la précision
+                    lat_deg_rat = (int(lat[0].num), int(lat[0].den)) if hasattr(lat[0], 'num') else (int(lat[0]), 1)
+                    lat_min_rat = (int(lat[1].num), int(lat[1].den)) if hasattr(lat[1], 'num') else (int(lat[1]), 1)
+                    lat_sec_rat = (int(lat[2].num), int(lat[2].den)) if hasattr(lat[2], 'num') else (int(lat[2]), 1)
+                    gps_data['GPSLatitude'] = (lat_deg_rat, lat_min_rat, lat_sec_rat)
+                    # Extraire la référence correctement
+                    if lat_ref:
+                        lat_ref_str = str(lat_ref.values).strip() if hasattr(lat_ref, 'values') else str(lat_ref).strip()
+                        gps_data['GPSLatitudeRef'] = lat_ref_str[0] if lat_ref_str else 'N'
+                    else:
+                        gps_data['GPSLatitudeRef'] = 'N'
             
             if 'GPS GPSLongitude' in tags:
                 lon = tags['GPS GPSLongitude'].values
                 lon_ref = tags.get('GPS GPSLongitudeRef', None)
                 if lon and len(lon) >= 3:
-                    # Convertir de degrés/minutes/secondes en degrés décimaux
-                    lon_deg = float(lon[0].num) / float(lon[0].den) if hasattr(lon[0], 'num') else float(lon[0])
-                    lon_min = float(lon[1].num) / float(lon[1].den) if hasattr(lon[1], 'num') else float(lon[1])
-                    lon_sec = float(lon[2].num) / float(lon[2].den) if hasattr(lon[2], 'num') else float(lon[2])
-                    lon_decimal = lon_deg + lon_min/60.0 + lon_sec/3600.0
-                    if lon_ref and 'W' in str(lon_ref.values):
-                        lon_decimal = -lon_decimal
-                    gps_data['GPSLongitude'] = lon_decimal
-                    gps_data['GPSLongitudeRef'] = str(lon_ref.values) if lon_ref else 'E'
+                    # Conserver directement les valeurs rationnelles DMS pour préserver la précision
+                    lon_deg_rat = (int(lon[0].num), int(lon[0].den)) if hasattr(lon[0], 'num') else (int(lon[0]), 1)
+                    lon_min_rat = (int(lon[1].num), int(lon[1].den)) if hasattr(lon[1], 'num') else (int(lon[1]), 1)
+                    lon_sec_rat = (int(lon[2].num), int(lon[2].den)) if hasattr(lon[2], 'num') else (int(lon[2]), 1)
+                    gps_data['GPSLongitude'] = (lon_deg_rat, lon_min_rat, lon_sec_rat)
+                    # Extraire la référence correctement
+                    if lon_ref:
+                        lon_ref_str = str(lon_ref.values).strip() if hasattr(lon_ref, 'values') else str(lon_ref).strip()
+                        gps_data['GPSLongitudeRef'] = lon_ref_str[0] if lon_ref_str else 'E'
+                    else:
+                        gps_data['GPSLongitudeRef'] = 'E'
             
             if 'GPS GPSAltitude' in tags:
                 alt = tags['GPS GPSAltitude'].values[0]
                 alt_ref = tags.get('GPS GPSAltitudeRef', None)
+                # Conserver directement la valeur rationnelle pour préserver la précision maximale
                 if hasattr(alt, 'num') and hasattr(alt, 'den'):
-                    altitude = float(alt.num) / float(alt.den)
+                    # La valeur est déjà en format rationnel, la conserver telle quelle
+                    alt_rat = (int(alt.num), int(alt.den))
                 else:
-                    altitude = float(alt)
-                if alt_ref and int(alt_ref.values[0]) == 1:  # 1 = below sea level
-                    altitude = -altitude
-                gps_data['GPSAltitude'] = altitude
+                    # Convertir en format rationnel avec précision maximale (multiplier par 10000 pour avoir des centimètres)
+                    alt_float = float(alt)
+                    alt_rat = (int(alt_float * 10000), 10000)  # Précision au centimètre
+                gps_data['GPSAltitude'] = alt_rat
+                # Extraire la référence d'altitude (0 = au-dessus du niveau de la mer, 1 = en dessous)
+                if alt_ref:
+                    alt_ref_val = int(alt_ref.values[0]) if hasattr(alt_ref, 'values') else int(alt_ref)
+                    gps_data['GPSAltitudeRef'] = alt_ref_val
+                else:
+                    gps_data['GPSAltitudeRef'] = 0
             
             if gps_data:
                 exif_data['GPS'] = gps_data
                 logger.info(f"Métadonnées GPS extraites: {gps_data}")
             
-            # Extraire d'autres métadonnées importantes
+            # Extraire les métadonnées de date/heure
             if 'EXIF DateTimeOriginal' in tags:
-                exif_data['DateTimeOriginal'] = str(tags['EXIF DateTimeOriginal'].values)
+                # Format EXIF: "YYYY:MM:DD HH:MM:SS"
+                dt_original = str(tags['EXIF DateTimeOriginal'].values).strip()
+                exif_data['DateTimeOriginal'] = dt_original
             
             if 'EXIF DateTimeDigitized' in tags:
-                exif_data['DateTimeDigitized'] = str(tags['EXIF DateTimeDigitized'].values)
+                dt_digitized = str(tags['EXIF DateTimeDigitized'].values).strip()
+                exif_data['DateTimeDigitized'] = dt_digitized
             
             if 'Image DateTime' in tags:
-                exif_data['DateTime'] = str(tags['Image DateTime'].values)
+                dt_image = str(tags['Image DateTime'].values).strip()
+                exif_data['DateTime'] = dt_image
+            
+            # Extraire les métadonnées GPS de date/heure (si disponibles)
+            if 'GPS GPSDateStamp' in tags:
+                gps_date = str(tags['GPS GPSDateStamp'].values).strip()
+                exif_data['GPSDateStamp'] = gps_date
+            
+            if 'GPS GPSTimeStamp' in tags:
+                gps_time = tags['GPS GPSTimeStamp'].values
+                # GPSTimeStamp est un tableau de 3 valeurs rationnelles [heures, minutes, secondes]
+                if gps_time and len(gps_time) >= 3:
+                    gps_time_rat = []
+                    for i in range(3):
+                        if hasattr(gps_time[i], 'num') and hasattr(gps_time[i], 'den'):
+                            gps_time_rat.append((int(gps_time[i].num), int(gps_time[i].den)))
+                        else:
+                            gps_time_rat.append((int(gps_time[i]), 1))
+                    exif_data['GPSTimeStamp'] = tuple(gps_time_rat)
             
             if 'EXIF Orientation' in tags:
                 exif_data['Orientation'] = int(tags['EXIF Orientation'].values[0])
@@ -475,46 +508,74 @@ class DNGToTIFFConverter:
                     if 'DateTime' in exif_data:
                         exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_data['DateTime'].encode('utf-8')
                     
+                    # Ajouter les métadonnées GPS de date/heure (si disponibles)
+                    if 'GPSDateStamp' in exif_data:
+                        exif_dict["GPS"][piexif.GPSIFD.GPSDateStamp] = exif_data['GPSDateStamp'].encode('utf-8')
+                    
+                    if 'GPSTimeStamp' in exif_data:
+                        exif_dict["GPS"][piexif.GPSIFD.GPSTimeStamp] = exif_data['GPSTimeStamp']
+                    
                     # Ajouter l'orientation
                     if 'Orientation' in exif_data:
                         exif_dict["0th"][piexif.ImageIFD.Orientation] = exif_data['Orientation']
                     
-                    # Ajouter les métadonnées GPS
+                    # Ajouter les métadonnées GPS en utilisant directement les valeurs rationnelles conservées
                     if 'GPS' in exif_data:
                         gps_data = exif_data['GPS']
                         
                         if 'GPSLatitude' in gps_data:
-                            lat = abs(gps_data['GPSLatitude'])
-                            # Convertir en format rationnel (degrés, minutes, secondes)
-                            lat_deg = int(lat)
-                            lat_min_float = (lat - lat_deg) * 60
-                            lat_min = int(lat_min_float)
-                            lat_sec_float = (lat_min_float - lat_min) * 60
-                            # Convertir secondes en rationnel (multiplier par 1000 pour précision)
-                            lat_sec_num = int(lat_sec_float * 1000)
-                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = ((lat_deg, 1), (lat_min, 1), (lat_sec_num, 1000))
-                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = 'S' if gps_data['GPSLatitude'] < 0 else 'N'
+                            # Utiliser directement les valeurs rationnelles DMS conservées
+                            lat_dms = gps_data['GPSLatitude']
+                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = lat_dms
+                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = gps_data.get('GPSLatitudeRef', 'N')
                         
                         if 'GPSLongitude' in gps_data:
-                            lon = abs(gps_data['GPSLongitude'])
-                            # Convertir en format rationnel (degrés, minutes, secondes)
-                            lon_deg = int(lon)
-                            lon_min_float = (lon - lon_deg) * 60
-                            lon_min = int(lon_min_float)
-                            lon_sec_float = (lon_min_float - lon_min) * 60
-                            # Convertir secondes en rationnel (multiplier par 1000 pour précision)
-                            lon_sec_num = int(lon_sec_float * 1000)
-                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = ((lon_deg, 1), (lon_min, 1), (lon_sec_num, 1000))
-                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = 'W' if gps_data['GPSLongitude'] < 0 else 'E'
+                            # Utiliser directement les valeurs rationnelles DMS conservées
+                            lon_dms = gps_data['GPSLongitude']
+                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = lon_dms
+                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = gps_data.get('GPSLongitudeRef', 'E')
                         
                         if 'GPSAltitude' in gps_data:
-                            alt = gps_data['GPSAltitude']
-                            # Convertir en format rationnel (mètres, multiplié par 100 pour précision)
-                            alt_cm = int(abs(alt) * 100)
-                            exif_dict["GPS"][piexif.GPSIFD.GPSAltitude] = (alt_cm, 100)
-                            exif_dict["GPS"][piexif.GPSIFD.GPSAltitudeRef] = 1 if alt < 0 else 0
+                            # Utiliser directement la valeur rationnelle conservée
+                            alt_rat = gps_data['GPSAltitude']
+                            exif_dict["GPS"][piexif.GPSIFD.GPSAltitude] = alt_rat
+                            exif_dict["GPS"][piexif.GPSIFD.GPSAltitudeRef] = gps_data.get('GPSAltitudeRef', 0)
                         
-                        logger.info(f"Métadonnées GPS ajoutées: Lat={gps_data.get('GPSLatitude'):.6f}, Lon={gps_data.get('GPSLongitude'):.6f}, Alt={gps_data.get('GPSAltitude', 0):.2f}m")
+                        # Log pour vérification (calculer les valeurs décimales pour l'affichage)
+                        try:
+                            if 'GPSLatitude' in gps_data:
+                                lat_dms = gps_data['GPSLatitude']
+                                lat_deg = lat_dms[0][0] / lat_dms[0][1]
+                                lat_min = lat_dms[1][0] / lat_dms[1][1]
+                                lat_sec = lat_dms[2][0] / lat_dms[2][1]
+                                lat_decimal = lat_deg + lat_min/60.0 + lat_sec/3600.0
+                                if gps_data.get('GPSLatitudeRef') == 'S':
+                                    lat_decimal = -lat_decimal
+                            else:
+                                lat_decimal = None
+                            
+                            if 'GPSLongitude' in gps_data:
+                                lon_dms = gps_data['GPSLongitude']
+                                lon_deg = lon_dms[0][0] / lon_dms[0][1]
+                                lon_min = lon_dms[1][0] / lon_dms[1][1]
+                                lon_sec = lon_dms[2][0] / lon_dms[2][1]
+                                lon_decimal = lon_deg + lon_min/60.0 + lon_sec/3600.0
+                                if gps_data.get('GPSLongitudeRef') == 'W':
+                                    lon_decimal = -lon_decimal
+                            else:
+                                lon_decimal = None
+                            
+                            if 'GPSAltitude' in gps_data:
+                                alt_rat = gps_data['GPSAltitude']
+                                alt_decimal = alt_rat[0] / alt_rat[1]
+                                if gps_data.get('GPSAltitudeRef') == 1:
+                                    alt_decimal = -alt_decimal
+                            else:
+                                alt_decimal = None
+                            
+                            logger.info(f"Métadonnées GPS ajoutées (précision maximale conservée): Lat={lat_decimal:.10f}, Lon={lon_decimal:.10f}, Alt={alt_decimal:.6f}m")
+                        except Exception as e:
+                            logger.info(f"Métadonnées GPS ajoutées (valeurs rationnelles conservées)")
                     
                     # Convertir en bytes EXIF
                     exif_bytes = piexif.dump(exif_dict)
@@ -563,6 +624,112 @@ class DNGToTIFFConverter:
         
         if successful_conversions > 0:
             logger.info(f"Fichiers TIFF sauvegardés dans: {self.output_dir}")
+            # Générer le fichier GPS pour MicMac
+            self.generate_gps_file_for_micmac()
+    
+    def generate_gps_file_for_micmac(self):
+        """
+        Génère le fichier GpsCoordinatesFromExif.txt au format MicMac
+        Format: nom longitude latitude altitude (une ligne par image, séparées par des espaces)
+        """
+        try:
+            # Trouver tous les fichiers TIFF dans le dossier de sortie (utiliser un set pour éviter les doublons sur Windows)
+            tiff_files = set(self.output_dir.glob("*.tiff")) | set(self.output_dir.glob("*.TIFF"))
+            tiff_files = sorted(list(tiff_files))
+            
+            if not tiff_files:
+                logger.warning("Aucun fichier TIFF trouvé pour générer le fichier GPS")
+                return
+            
+            logger.info(f"\n=== GÉNÉRATION DU FICHIER GPS POUR MICMAC ===")
+            logger.info(f"Analyse de {len(tiff_files)} fichier(s) TIFF...")
+            
+            gps_data_list = []
+            processed_files = set()  # Pour éviter les doublons
+            
+            for tiff_file in tqdm(tiff_files, desc="Extraction GPS"):
+                # Vérifier si le fichier n'a pas déjà été traité (normaliser en minuscules pour Windows)
+                file_key = tiff_file.name.lower()
+                if file_key in processed_files:
+                    continue
+                processed_files.add(file_key)
+                try:
+                    # Lire les métadonnées GPS depuis le TIFF
+                    with open(tiff_file, 'rb') as f:
+                        tags = exifread.process_file(f, details=False)
+                    
+                    # Extraire les coordonnées GPS
+                    if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
+                        # Extraire latitude (DMS → décimales avec précision maximale)
+                        lat = tags['GPS GPSLatitude'].values
+                        lat_ref = tags.get('GPS GPSLatitudeRef', None)
+                        if lat and len(lat) >= 3:
+                            lat_deg = float(lat[0].num) / float(lat[0].den) if hasattr(lat[0], 'num') else float(lat[0])
+                            lat_min = float(lat[1].num) / float(lat[1].den) if hasattr(lat[1], 'num') else float(lat[1])
+                            lat_sec = float(lat[2].num) / float(lat[2].den) if hasattr(lat[2], 'num') else float(lat[2])
+                            lat_decimal = lat_deg + lat_min/60.0 + lat_sec/3600.0
+                            if lat_ref and 'S' in str(lat_ref.values):
+                                lat_decimal = -lat_decimal
+                        else:
+                            continue
+                        
+                        # Extraire longitude (DMS → décimales avec précision maximale)
+                        lon = tags['GPS GPSLongitude'].values
+                        lon_ref = tags.get('GPS GPSLongitudeRef', None)
+                        if lon and len(lon) >= 3:
+                            lon_deg = float(lon[0].num) / float(lon[0].den) if hasattr(lon[0], 'num') else float(lon[0])
+                            lon_min = float(lon[1].num) / float(lon[1].den) if hasattr(lon[1], 'num') else float(lon[1])
+                            lon_sec = float(lon[2].num) / float(lon[2].den) if hasattr(lon[2], 'num') else float(lon[2])
+                            lon_decimal = lon_deg + lon_min/60.0 + lon_sec/3600.0
+                            if lon_ref and 'W' in str(lon_ref.values):
+                                lon_decimal = -lon_decimal
+                        else:
+                            continue
+                        
+                        # Extraire altitude avec précision maximale
+                        altitude = None
+                        if 'GPS GPSAltitude' in tags:
+                            alt = tags['GPS GPSAltitude'].values[0]
+                            alt_ref = tags.get('GPS GPSAltitudeRef', None)
+                            if hasattr(alt, 'num') and hasattr(alt, 'den'):
+                                altitude = float(alt.num) / float(alt.den)
+                            else:
+                                altitude = float(alt)
+                            if alt_ref and int(alt_ref.values[0]) == 1:  # 1 = below sea level
+                                altitude = -altitude
+                        
+                        if altitude is not None:
+                            # Stocker les données : (nom fichier, longitude, latitude, altitude)
+                            gps_data_list.append((tiff_file.name, lon_decimal, lat_decimal, altitude))
+                        else:
+                            logger.warning(f"Altitude manquante pour {tiff_file.name}, ignoré")
+                    
+                except Exception as e:
+                    logger.warning(f"Erreur lors de l'extraction GPS de {tiff_file.name}: {e}")
+                    continue
+            
+            if not gps_data_list:
+                logger.warning("Aucune donnée GPS trouvée dans les fichiers TIFF")
+                return
+            
+            # Générer le fichier au format MicMac
+            gps_file_path = self.output_dir / "GpsCoordinatesFromExif.txt"
+            
+            with open(gps_file_path, 'w', encoding='utf-8') as f:
+                # Écrire les données avec précision maximale (format: nom longitude latitude altitude)
+                for filename, lon, lat, alt in gps_data_list:
+                    # Utiliser un format avec suffisamment de décimales pour la précision RTK
+                    f.write(f"{filename} {lon:.15f} {lat:.15f} {alt:.6f}\n")
+            
+            logger.info(f"✓ Fichier GPS généré: {gps_file_path}")
+            logger.info(f"  {len(gps_data_list)} image(s) avec coordonnées GPS")
+            logger.info(f"  Format: nom longitude latitude altitude")
+            logger.info(f"  Précision: Longitude/Latitude (15 décimales), Altitude (6 décimales)")
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Erreur lors de la génération du fichier GPS: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
 
 def interactive_mode():
     """Mode interactif pour faciliter l'utilisation"""
