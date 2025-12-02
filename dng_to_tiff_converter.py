@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class DNGToTIFFConverter:
     """Convertisseur de fichiers DNG vers TIFF"""
     
-    def __init__(self, input_dir, output_dir=None, quality=95, keep_16bit=False, brightness=1.5, contrast=1.0):
+    def __init__(self, input_dir, output_dir=None, quality=95, keep_16bit=False, brightness=1.5, contrast=1.0, force_orientation=None):
         """
         Initialise le convertisseur
         
@@ -43,6 +43,7 @@ class DNGToTIFFConverter:
             keep_16bit (bool): Conserver les 16 bits (recommandé pour photogrammétrie)
             brightness (float): Facteur de luminosité (0.5-2.0, défaut 1.5)
             contrast (float): Facteur de contraste (0.5-2.0, défaut 1.0)
+            force_orientation (str): Forcer l'orientation ("landscape" ou "portrait", None pour conserver l'original)
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir) if output_dir else self.input_dir / "TIFF_output"
@@ -75,6 +76,17 @@ class DNGToTIFFConverter:
         except (ValueError, TypeError) as e:
             logger.warning(f"Contraste invalide '{contrast}', utilisation de la valeur par défaut 1.0")
             self.contrast = 1.0
+        
+        # Validation de l'orientation forcée
+        if force_orientation is not None:
+            force_orientation = str(force_orientation).lower()
+            if force_orientation not in ['landscape', 'portrait']:
+                logger.warning(f"Orientation forcée invalide '{force_orientation}', ignorée (doit être 'landscape' ou 'portrait')")
+                self.force_orientation = None
+            else:
+                self.force_orientation = force_orientation
+        else:
+            self.force_orientation = None
         
         # Créer le répertoire de sortie s'il n'existe pas
         self.output_dir.mkdir(exist_ok=True)
@@ -432,6 +444,46 @@ class DNGToTIFFConverter:
             else:
                 image = Image.fromarray(rgb_array, 'RGB')
             
+            # Appliquer la rotation forcée si demandée
+            if self.force_orientation:
+                width, height = image.size
+                is_landscape = width > height
+                orientation = exif_data.get('Orientation', 1)
+                
+                logger.info(f"Image {dng_path.name}: dimensions={width}x{height}, is_landscape={is_landscape}, orientation_EXIF={orientation}")
+                
+                if self.force_orientation == 'landscape' and not is_landscape:
+                    # Forcer paysage depuis portrait : déterminer le sens de rotation selon l'orientation EXIF
+                    # Orientation 6 = image doit être tournée de 90° horaire pour être correcte
+                    # Orientation 8 = image doit être tournée de 90° anti-horaire pour être correcte
+                    if orientation == 6:
+                        # Image portrait avec orientation 6 → tourner de +90° pour paysage (inversé)
+                        image = image.rotate(90, expand=True)
+                        logger.info(f"Image tournée de +90° pour forcer le paysage (orientation EXIF: {orientation})")
+                    elif orientation == 8:
+                        # Image portrait avec orientation 8 → tourner de -90° pour paysage (inversé)
+                        image = image.rotate(-90, expand=True)
+                        logger.info(f"Image tournée de -90° pour forcer le paysage (orientation EXIF: {orientation})")
+                    else:
+                        # Par défaut, essayer l'autre sens
+                        image = image.rotate(90, expand=True)
+                        logger.info(f"Image tournée de +90° pour forcer le paysage (orientation EXIF: {orientation}, défaut inversé)")
+                        
+                elif self.force_orientation == 'portrait' and is_landscape:
+                    # Forcer portrait depuis paysage : déterminer le sens de rotation selon l'orientation EXIF
+                    if orientation == 6:
+                        # Pour forcer portrait depuis paysage avec orientation 6 → tourner de -90° (inversé)
+                        image = image.rotate(-90, expand=True)
+                        logger.info(f"Image tournée de -90° pour forcer le portrait (orientation EXIF: {orientation})")
+                    elif orientation == 8:
+                        # Pour forcer portrait depuis paysage avec orientation 8 → tourner de +90° (inversé)
+                        image = image.rotate(90, expand=True)
+                        logger.info(f"Image tournée de +90° pour forcer le portrait (orientation EXIF: {orientation})")
+                    else:
+                        # Par défaut, essayer l'autre sens
+                        image = image.rotate(90, expand=True)
+                        logger.info(f"Image tournée de +90° pour forcer le portrait (orientation EXIF: {orientation}, défaut inversé)")
+            
             # Sauvegarder en TIFF sans compression (compatible MicMac)
             save_kwargs = {
                 'format': 'TIFF'
@@ -515,8 +567,11 @@ class DNGToTIFFConverter:
                     if 'GPSTimeStamp' in exif_data:
                         exif_dict["GPS"][piexif.GPSIFD.GPSTimeStamp] = exif_data['GPSTimeStamp']
                     
-                    # Ajouter l'orientation
-                    if 'Orientation' in exif_data:
+                    # Ajouter l'orientation (mettre à 1 si rotation forcée appliquée)
+                    if self.force_orientation:
+                        # Après rotation physique, l'orientation est normale
+                        exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
+                    elif 'Orientation' in exif_data:
                         exif_dict["0th"][piexif.ImageIFD.Orientation] = exif_data['Orientation']
                     
                     # Ajouter les métadonnées GPS en utilisant directement les valeurs rationnelles conservées
@@ -820,6 +875,23 @@ def interactive_mode():
         except ValueError:
             print("❌ Veuillez entrer un nombre valide")
     
+    # Demander l'orientation forcée
+    print()
+    print("🔄 Orientation forcée:")
+    print("   • landscape: Forcer toutes les images en paysage")
+    print("   • portrait: Forcer toutes les images en portrait")
+    print("   • (vide): Conserver l'orientation originale")
+    while True:
+        orientation_input = input("   Orientation (landscape/portrait/vide): ").strip().lower()
+        if not orientation_input:
+            force_orientation = None
+            break
+        elif orientation_input in ['landscape', 'portrait']:
+            force_orientation = orientation_input
+            break
+        else:
+            print("❌ Veuillez entrer 'landscape', 'portrait' ou laisser vide")
+    
     # Confirmation
     print()
     print("📋 RÉCAPITULATIF:")
@@ -829,6 +901,7 @@ def interactive_mode():
     print(f"   • 16 bits conservés: {'Oui' if keep_16bit else 'Non'}")
     print(f"   • Luminosité: {brightness}")
     print(f"   • Contraste: {contrast}")
+    print(f"   • Orientation forcée: {force_orientation or 'Aucune (conservation originale)'}")
     print(f"   • Nombre de fichiers: {len(dng_files)}")
     print()
     
@@ -845,7 +918,8 @@ def interactive_mode():
         quality=int(quality),  # S'assurer que c'est un entier
         keep_16bit=keep_16bit,
         brightness=brightness,
-        contrast=contrast
+        contrast=contrast,
+        force_orientation=force_orientation
     )
     
     converter.convert_all()
@@ -908,6 +982,14 @@ Exemples d'utilisation:
         help='Facteur de contraste (0.5-2.0, défaut 1.0)'
     )
     
+    parser.add_argument(
+        '--force-orientation',
+        type=str,
+        choices=['landscape', 'portrait'],
+        default=None,
+        help='Forcer toutes les images en paysage ou portrait (ignore l\'orientation EXIF)'
+    )
+    
     args = parser.parse_args()
     
     # Ajuster le niveau de logging
@@ -932,7 +1014,8 @@ Exemples d'utilisation:
         quality=100,  # Qualité fixée pour compatibilité MicMac
         keep_16bit=args.keep_16bit,
         brightness=args.brightness,
-        contrast=args.contrast
+        contrast=args.contrast,
+        force_orientation=args.force_orientation
     )
     
     converter.convert_all()
