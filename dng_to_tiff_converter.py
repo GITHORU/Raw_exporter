@@ -102,102 +102,6 @@ class DNGToTIFFConverter:
         logger.info(f"Trouvé {len(dng_files)} fichier(s) DNG")
         return dng_files
     
-    def get_crop_factor(self, make, model, sensor_width=None, sensor_height=None):
-        """
-        Détermine le facteur de conversion (crop factor) pour calculer la focale équivalente 35mm
-        
-        Args:
-            make: Marque de l'appareil photo
-            model: Modèle de l'appareil photo
-            sensor_width: Largeur du capteur en mm (si disponible dans les EXIF)
-            sensor_height: Hauteur du capteur en mm (si disponible dans les EXIF)
-            
-        Returns:
-            float: Facteur de conversion (1.0 = plein format, 2.0 = Micro Four Thirds, etc.)
-        """
-        # Si on a les dimensions du capteur, calculer le facteur précisément
-        if sensor_width and sensor_height:
-            # Capteur plein format = 36mm x 24mm
-            full_frame_diagonal = (36**2 + 24**2)**0.5  # ≈ 43.27mm
-            sensor_diagonal = (sensor_width**2 + sensor_height**2)**0.5
-            crop_factor = full_frame_diagonal / sensor_diagonal
-            logger.info(f"Facteur de conversion calculé depuis les dimensions du capteur: {crop_factor:.2f}x")
-            return crop_factor
-        
-        # Sinon, utiliser les valeurs connues par marque/modèle
-        make_lower = str(make).lower() if make else ""
-        model_lower = str(model).lower() if model else ""
-        
-        # Micro Four Thirds (Olympus, Panasonic, OM Digital) - 17.3mm x 13mm
-        if any(brand in make_lower for brand in ['olympus', 'om digital', 'panasonic']):
-            logger.info(f"Micro Four Thirds détecté ({make} {model}), facteur: 2.0x")
-            return 2.0
-        
-        # APS-C Canon (22.3mm x 14.9mm) - 1.6x
-        if 'canon' in make_lower:
-            # Certains modèles Canon sont plein format
-            if any(full_frame in model_lower for full_frame in ['1d', '5d', '6d', 'r5', 'r6', 'r3']):
-                logger.info(f"Canon plein format détecté ({model}), facteur: 1.0x")
-                return 1.0
-            logger.info(f"Canon APS-C détecté ({model}), facteur: 1.6x")
-            return 1.6
-        
-        # APS-C Nikon (23.5mm x 15.6mm) - 1.5x
-        if 'nikon' in make_lower:
-            # Les modèles plein format
-            if any(full_frame in model_lower for full_frame in ['d3', 'd4', 'd5', 'd6', 'd700', 'd800', 'd810', 'd850', 'z7', 'z9', 'z8']):
-                logger.info(f"Nikon plein format détecté ({model}), facteur: 1.0x")
-                return 1.0
-            logger.info(f"Nikon APS-C détecté ({model}), facteur: 1.5x")
-            return 1.5
-        
-        # Sony
-        if 'sony' in make_lower:
-            # A7, A9, A1 sont plein format
-            if any(full_frame in model_lower for full_frame in ['a7', 'a9', 'a1']):
-                logger.info(f"Sony plein format détecté ({model}), facteur: 1.0x")
-                return 1.0
-            # A6000, A6300, A6400, A6500, A6600 sont APS-C
-            if any(aps_c in model_lower for aps_c in ['a6000', 'a6300', 'a6400', 'a6500', 'a6600']):
-                logger.info(f"Sony APS-C détecté ({model}), facteur: 1.5x")
-                return 1.5
-            # Par défaut, considérer APS-C pour Sony
-            logger.warning(f"Sony modèle non reconnu ({model}), utilisation du facteur APS-C par défaut: 1.5x")
-            return 1.5
-        
-        # Fujifilm (APS-C généralement)
-        if 'fujifilm' in make_lower or 'fuji' in make_lower:
-            # GFX sont moyen format (0.79x)
-            if 'gfx' in model_lower:
-                logger.info(f"Fujifilm moyen format détecté ({model}), facteur: 0.79x")
-                return 0.79
-            logger.info(f"Fujifilm APS-C détecté ({model}), facteur: 1.5x")
-            return 1.5
-        
-        # Pentax
-        if 'pentax' in make_lower:
-            # K-1 est plein format
-            if 'k-1' in model_lower:
-                logger.info(f"Pentax plein format détecté ({model}), facteur: 1.0x")
-                return 1.0
-            logger.info(f"Pentax APS-C détecté ({model}), facteur: 1.5x")
-            return 1.5
-        
-        # Leica (souvent plein format)
-        if 'leica' in make_lower:
-            logger.info(f"Leica détecté ({model}), facteur: 1.0x (plein format présumé)")
-            return 1.0
-        
-        # Hasselblad (moyen format)
-        if 'hasselblad' in make_lower:
-            logger.info(f"Hasselblad détecté ({model}), facteur: 0.64x (moyen format)")
-            return 0.64
-        
-        # Par défaut, si on ne connaît pas, ne pas calculer la focale équivalente
-        logger.warning(f"Marque/modèle inconnu ({make}/{model}), impossible de déterminer le facteur de conversion")
-        logger.warning("Suggestion: vérifiez les spécifications de votre appareil ou ajoutez-le manuellement")
-        return None
-    
     def extract_exif_metadata(self, dng_path):
         """
         Extrait les métadonnées EXIF importantes du fichier RAW en utilisant exifread
@@ -518,26 +422,14 @@ class DNGToTIFFConverter:
                         # Ajouter dans le IFD EXIF (la focale n'existe pas dans le IFD Image)
                         exif_dict["Exif"][piexif.ExifIFD.FocalLength] = focal_rational
                         
-                        # Ajouter la focale équivalente 35mm pour MicMac
+                        # Ajouter la focale équivalente 35mm pour MicMac (uniquement si présente dans les EXIF)
                         if 'FocalLengthIn35mmFilm' in exif_data:
                             # Utiliser la valeur déjà présente dans les métadonnées
                             focal_35mm = int(exif_data['FocalLengthIn35mmFilm'])
                             exif_dict["Exif"][piexif.ExifIFD.FocalLengthIn35mmFilm] = focal_35mm
                             logger.info(f"Focale équivalente 35mm trouvée dans les métadonnées: {focal_35mm}mm")
                         else:
-                            # Calculer avec le facteur de conversion détecté
-                            make = exif_data.get('Make', '')
-                            model = exif_data.get('Model', '')
-                            sensor_width = exif_data.get('SensorWidth')
-                            sensor_height = exif_data.get('SensorHeight')
-                            crop_factor = self.get_crop_factor(make, model, sensor_width, sensor_height)
-                            
-                            if crop_factor is not None:
-                                focal_35mm = int(focal_length * crop_factor)
-                                exif_dict["Exif"][piexif.ExifIFD.FocalLengthIn35mmFilm] = focal_35mm
-                                logger.info(f"Focale: {focal_length}mm → Équivalent 35mm: {focal_35mm}mm (facteur: {crop_factor}x)")
-                            else:
-                                logger.warning(f"Impossible de calculer la focale équivalente 35mm pour {make} {model}")
+                            logger.info("Focale équivalente 35mm absente des métadonnées EXIF, non exportée")
                     
                     if 'FNumber' in exif_data:
                         f_number = float(exif_data['FNumber'])
